@@ -733,10 +733,7 @@ pub(crate) fn run_network_instance_from_json(cfg_json: &str) -> bool {
         return false;
     }
 
-    let Some(config_control) = nearby_management::runtime_management_config_control(inst_id) else {
-        ohrs_log_error!("[Rust] nearby management config store is not initialized");
-        return false;
-    };
+    let config_control = nearby_management::runtime_management_config_control(inst_id);
     if !nearby_management::ensure_runtime_management_server_started() {
         return false;
     }
@@ -748,9 +745,6 @@ pub(crate) fn run_network_instance_from_json(cfg_json: &str) -> bool {
         }
         Err(err) => {
             ohrs_log_error!("[Rust] start_kernel failed for {}: {}", inst_id, err);
-            if INSTANCE_MANAGER.instance_ids().is_empty() {
-                let _ = nearby_management::stop_runtime_management_server();
-            }
             false
         }
     }
@@ -863,16 +857,12 @@ pub fn start_kernel(config_id: String) -> bool {
 
 #[napi]
 pub fn stop_kernel(config_id: String) -> bool {
-    let stopped = exports::runtime_api::stop_kernel(
+    exports::runtime_api::stop_kernel(
         config_id,
         stop_web_client,
         parse_instance_uuid,
         maybe_stop_local_socket_server,
-    );
-    if stopped && INSTANCE_MANAGER.instance_ids().is_empty() {
-        let _ = nearby_management::stop_runtime_management_server();
-    }
-    stopped
+    )
 }
 
 #[napi]
@@ -975,6 +965,50 @@ pub fn parse_network_config(cfg_json: String) -> bool {
 #[napi]
 pub fn run_network_instance(cfg_json: String) -> bool {
     run_network_instance_from_json(&cfg_json)
+}
+
+/// Starts the management server in the VPN Extension process even when no
+/// network instance is active, allowing a nearby controller to deploy a
+/// one-shot config through the canonical Core RPC surface.
+#[napi]
+pub fn start_nearby_management_host() -> bool {
+    nearby_management::ensure_runtime_management_server_started()
+}
+
+#[napi]
+pub fn stop_nearby_management_host() -> bool {
+    nearby_management::stop_runtime_management_server()
+}
+
+#[napi]
+pub fn drain_nearby_host_commands() -> Vec<nearby_management::NearbyHostCommand> {
+    nearby_management::drain_nearby_host_commands()
+}
+
+#[napi]
+pub fn complete_nearby_host_command(
+    request_id: String,
+    success: bool,
+    error: Option<String>,
+) -> bool {
+    nearby_management::complete_nearby_host_command(request_id, success, error)
+}
+
+/// Returns 1 for canonical Core RPC packets, 2 for the OHOS-private settings
+/// envelope, and 0 for malformed or unsupported data.
+#[napi]
+pub fn nearby_management_packet_kind(packet: Uint8Array) -> i32 {
+    nearby_management::nearby_management_packet_kind(packet)
+}
+
+#[napi]
+pub fn encode_nearby_ohos_packet(envelope_json: String) -> Option<Uint8Array> {
+    nearby_management::encode_nearby_ohos_packet(envelope_json)
+}
+
+#[napi]
+pub fn decode_nearby_ohos_packet(packet: Uint8Array) -> Option<String> {
+    nearby_management::decode_nearby_ohos_packet(packet)
 }
 
 /// Opens one Core RPC endpoint for a HarmonyOS collaboration session.

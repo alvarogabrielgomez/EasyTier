@@ -6,7 +6,7 @@
 //! exposes the empty `InstanceManager` loaded by `EntryAbility`.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt, io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::{Path, PathBuf},
@@ -16,20 +16,19 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use bytes::BytesMut;
 use easytier::{
-    common::config::{ConfigLoader as _, NetworkConfigExt as _, TomlConfigLoader},
-    instance::factory::NativeInstanceFactory,
+    common::config::NetworkConfigExt as _, instance::factory::NativeInstanceFactory,
     rpc_service::logger::NativeLoggerControl,
 };
 use easytier_core::{
-    config::{api::network_config_from_toml, toml::TomlConfig},
     management::{
-        ConfigFileControl, ConfigFilePermission, ConfigFileStorage, InstanceMutationHooks,
-        LoggerManagementRpc, ProcessManagementRpc, register_instance_management_rpc,
+        ConfigFileControl, LoggerManagementRpc, ProcessManagementRpc, UnsupportedConfigFileStorage,
+        register_instance_management_rpc,
     },
     packet::{PacketType, ZCPacket, ZCPacketType},
     rpc::{bidirect::BidirectRpcManager, client::Client, standalone::StandAloneServer},
@@ -64,27 +63,24 @@ use easytier_proto::{
     rpc_types::{controller::BaseController, error::Error as RpcError},
 };
 use futures::{SinkExt, StreamExt};
+use napi_derive_ohos::napi;
 use napi_ohos::bindgen_prelude::Uint8Array;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{UnixListener, UnixStream},
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::{
+        mpsc::{Receiver, Sender, channel},
+        oneshot,
+    },
     task::JoinHandle,
+    time::timeout,
 };
 use url::Url;
 use uuid::Uuid;
 
-use crate::{
-    ASYNC_RUNTIME, INSTANCE_MANAGER,
-    config::{
-        repository::{
-            cache_runtime_config_snapshot, config_root_dir, get_runtime_config_snapshot,
-            load_config_json, save_config_record,
-        },
-        storage::config_meta::get_config_display_name,
-    },
-};
+use crate::{ASYNC_RUNTIME, INSTANCE_MANAGER, config::repository::config_root_dir};
 
 const MAX_NEARBY_SESSIONS: usize = 8;
 const MAX_SESSION_KEY_LENGTH: usize = 128;
@@ -94,7 +90,50 @@ const MAX_DRAIN_PACKETS: usize = 256;
 const PACKET_QUEUE_CAPACITY: usize = 256;
 const RPC_PEER_ID: u32 = 1;
 const MANAGEMENT_SOCKET_FILE_NAME: &str = "easytier-nearby-management.sock";
-const MANAGEMENT_CONFIG_DIR_NAME: &str = ".easytier-nearby-management";
+const MAX_PENDING_HOST_COMMANDS: usize = 8;
+const HOST_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const HOST_COMMAND_START: &str = "start_once";
+const HOST_COMMAND_STOP: &str = "stop";
+const OHOS_PRIVATE_PACKET_TYPE: u8 = 0xF0;
+const OHOS_PRIVATE_SCHEMA_VERSION: u32 = 1;
+const MAX_OHOS_PRIVATE_PAYLOAD_BYTES: usize = 16 * 1024;
+const MAX_OHOS_PRIVATE_ERROR_LENGTH: usize = 512;
+const OHOS_OPERATION_GET_SETTINGS: &str = "get_settings";
+const OHOS_OPERATION_UPDATE_SETTING: &str = "update_setting";
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NearbyOhosEnvelope {
+    schema_version: u32,
+    kind: String,
+    request_id: String,
+    operation: String,
+    payload_json: Option<String>,
+    ok: Option<bool>,
+    error: Option<String>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NearbyHostCommand {
+    pub request_id: String,
+    pub operation: String,
+    pub instance_id: String,
+    pub config_json: Option<String>,
+}
+
+struct NearbyHostCommandState {
+    queued: VecDeque<NearbyHostCommand>,
+    completions: HashMap<String, oneshot::Sender<Result<(), String>>>,
+}
+
+static NEARBY_HOST_COMMANDS: once_cell::sync::Lazy<Mutex<NearbyHostCommandState>> =
+    once_cell::sync::Lazy::new(|| {
+        Mutex::new(NearbyHostCommandState {
+            queued: VecDeque::new(),
+            completions: HashMap::new(),
+        })
+    });
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NearbyRole {
@@ -228,91 +267,77 @@ impl Drop for NearbyUnixListener {
     }
 }
 
-struct NearbyConfigStorage;
+async fn dispatch_host_command(
+    operation: &str,
+    instance_id: Uuid,
+    config_json: Option<String>,
+) -> Result<(), RpcError> {
+    let request_id = Uuid::new_v4().to_string();
+    let command = NearbyHostCommand {
+        request_id: request_id.clone(),
+        operation: operation.to_owned(),
+        instance_id: instance_id.to_string(),
+        config_json,
+    };
+    let (sender, receiver) = oneshot::channel::<Result<(), String>>();
+    {
+        let mut state = NEARBY_HOST_COMMANDS
+            .lock()
+            .map_err(|_| anyhow::anyhow!("HarmonyOS host command queue is unavailable"))?;
+        if state.queued.len() >= MAX_PENDING_HOST_COMMANDS
+            || state.completions.len() >= MAX_PENDING_HOST_COMMANDS
+        {
+            return Err(anyhow::anyhow!("HarmonyOS host command queue is full").into());
+        }
+        state.completions.insert(request_id.clone(), sender);
+        state.queued.push_back(command);
+    }
 
-#[async_trait]
-impl ConfigFileStorage for NearbyConfigStorage {
-    async fn inspect(&self, path: &Path) -> ConfigFileControl {
-        match config_id_from_management_path(path) {
-            Ok(_) => ConfigFileControl::new(
-                Some(path.to_owned()),
-                ConfigFilePermission::from(ConfigFilePermission::NO_DELETE),
-            ),
-            Err(_) => ConfigFileControl::new(
-                Some(path.to_owned()),
-                ConfigFilePermission::from(
-                    ConfigFilePermission::READ_ONLY | ConfigFilePermission::NO_DELETE,
-                ),
-            ),
+    let completion = timeout(HOST_COMMAND_TIMEOUT, receiver).await;
+    let timed_out = completion.is_err();
+    if let Ok(mut state) = NEARBY_HOST_COMMANDS.lock() {
+        state.completions.remove(&request_id);
+        if timed_out {
+            state
+                .queued
+                .retain(|command| command.request_id != request_id);
         }
     }
-
-    async fn read(&self, path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
-        let config_id = config_id_from_management_path(path)?;
-        let Some(raw) = load_config_json(&config_id.to_string()) else {
-            return Ok(None);
-        };
-        let config = serde_json::from_str::<easytier_proto::api::manage::NetworkConfig>(&raw)?;
-        Ok(Some(config.gen_config()?.dump().into_bytes()))
-    }
-
-    async fn write(&self, path: &Path, contents: &[u8]) -> anyhow::Result<()> {
-        let config_id = config_id_from_management_path(path)?;
-        let toml = std::str::from_utf8(contents)?;
-        let config = TomlConfigLoader::new_from_str(toml)?;
-        if config.get_id() != config_id {
-            anyhow::bail!("nearby management cannot change the running instance ID");
-        }
-        let network_config = network_config_from_toml(&config);
-        let display_name = get_config_display_name(&config_id.to_string())
-            .or_else(|| {
-                get_runtime_config_snapshot(&config_id.to_string())
-                    .map(|snapshot| snapshot.display_name)
-            })
-            .unwrap_or_else(|| config.get_inst_name());
-        let raw = serde_json::to_string(&network_config)?;
-        save_config_record(config_id.to_string(), display_name, raw)
-            .ok_or_else(|| anyhow::anyhow!("failed to persist nearby management config"))?;
-        Ok(())
-    }
-
-    async fn remove(&self, _path: &Path) -> anyhow::Result<()> {
-        anyhow::bail!("nearby management never deletes a saved HarmonyOS config")
+    match completion {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(anyhow::anyhow!(error).into()),
+        Ok(Err(_)) => Err(anyhow::anyhow!("HarmonyOS host command was cancelled").into()),
+        Err(_) => Err(anyhow::anyhow!("HarmonyOS host command timed out").into()),
     }
 }
 
-struct NearbyMutationHooks;
+pub(crate) fn drain_nearby_host_commands() -> Vec<NearbyHostCommand> {
+    NEARBY_HOST_COMMANDS
+        .lock()
+        .map(|mut state| state.queued.drain(..).collect())
+        .unwrap_or_default()
+}
 
-#[async_trait]
-impl InstanceMutationHooks for NearbyMutationHooks {
-    async fn pre_run_network_instance(&self, config: &TomlConfig) -> Result<(), String> {
-        let instance_ids = INSTANCE_MANAGER.instance_ids();
-        if instance_ids.len() != 1 || instance_ids[0] != config.get_id() {
-            return Err(
-                "nearby management may only overwrite the single running HarmonyOS instance"
-                    .to_owned(),
-            );
-        }
+pub(crate) fn complete_nearby_host_command(
+    request_id: String,
+    success: bool,
+    error: Option<String>,
+) -> bool {
+    let sender = NEARBY_HOST_COMMANDS
+        .lock()
+        .ok()
+        .and_then(|mut state| state.completions.remove(&request_id));
+    let Some(sender) = sender else {
+        return false;
+    };
+    let result = if success {
         Ok(())
-    }
-
-    async fn post_run_network_instance(&self, instance_id: &Uuid) -> Result<(), String> {
-        let config = INSTANCE_MANAGER
-            .config(*instance_id)
-            .ok_or_else(|| format!("instance {instance_id} is missing after restart"))?;
-        let display_name = get_config_display_name(&instance_id.to_string())
-            .or_else(|| {
-                get_runtime_config_snapshot(&instance_id.to_string())
-                    .map(|snapshot| snapshot.display_name)
-            })
-            .unwrap_or_else(|| config.get_inst_name());
-        cache_runtime_config_snapshot(
-            instance_id.to_string(),
-            display_name,
-            network_config_from_toml(&config),
-        );
-        Ok(())
-    }
+    } else {
+        Err(error
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| "HarmonyOS host rejected the command".to_owned()))
+    };
+    sender.send(result).is_ok()
 }
 
 #[derive(Clone)]
@@ -325,43 +350,52 @@ impl NearbyWebClientService {
         Self {
             inner: ProcessManagementRpc::new(
                 INSTANCE_MANAGER.clone(),
-                Arc::new(NearbyMutationHooks),
-                Arc::new(NearbyConfigStorage),
+                Arc::new(()),
+                Arc::new(UnsupportedConfigFileStorage),
             ),
         }
     }
 
-    fn ensure_safe_overwrite(&self, request: &RunNetworkInstanceRequest) -> Result<(), RpcError> {
-        if !request.overwrite {
-            return Err(anyhow::anyhow!("nearby management requires an explicit overwrite").into());
-        }
-        let requested_id = request
-            .inst_id
-            .clone()
-            .map(Uuid::from)
-            .ok_or_else(|| anyhow::anyhow!("nearby management requires an instance ID"))?;
-        let running = INSTANCE_MANAGER.instance_ids();
-        if running.len() != 1 || running[0] != requested_id {
+    fn validate_one_shot_start(
+        &self,
+        request: &RunNetworkInstanceRequest,
+    ) -> Result<(Uuid, String), RpcError> {
+        if request.overwrite {
             return Err(anyhow::anyhow!(
-                "nearby management may only overwrite the single running HarmonyOS instance"
+                "HarmonyOS nearby deployment is one-shot and never overwrites a running config"
             )
             .into());
         }
-        let expected_path = management_config_path(requested_id)
-            .ok_or_else(|| anyhow::anyhow!("HarmonyOS config store is not initialized"))?;
-        let control = INSTANCE_MANAGER
-            .config_control(requested_id)
-            .ok_or_else(|| anyhow::anyhow!("running instance config control is missing"))?;
-        if control.path.as_deref() != Some(expected_path.as_path())
-            || control.is_read_only()
-            || !control.is_no_delete()
-        {
+        let requested_id = request.inst_id.clone().map(Uuid::from).ok_or_else(|| {
+            anyhow::anyhow!("HarmonyOS nearby deployment requires an instance ID")
+        })?;
+        let config = request
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("HarmonyOS nearby deployment requires a config"))?;
+        config.gen_config()?;
+        let config_id = config
+            .instance_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("HarmonyOS nearby config has no instance ID"))?;
+        let parsed_config_id = Uuid::parse_str(config_id)
+            .map_err(|_| anyhow::anyhow!("HarmonyOS nearby config instance ID is invalid"))?;
+        if parsed_config_id != requested_id {
             return Err(anyhow::anyhow!(
-                "running instance is not owned by the HarmonyOS nearby console"
+                "HarmonyOS nearby config instance ID does not match the request"
             )
             .into());
         }
-        Ok(())
+        if !INSTANCE_MANAGER.instance_ids().is_empty() {
+            return Err(anyhow::anyhow!(
+                "HarmonyOS config is running; stop it before deploying another config"
+            )
+            .into());
+        }
+        let config_json = serde_json::to_string(config).map_err(|error| {
+            anyhow::anyhow!("failed to encode HarmonyOS one-shot config: {error}")
+        })?;
+        Ok((requested_id, config_json))
     }
 }
 
@@ -379,11 +413,20 @@ impl WebClientService for NearbyWebClientService {
 
     async fn run_network_instance(
         &self,
-        controller: BaseController,
+        _controller: BaseController,
         request: RunNetworkInstanceRequest,
     ) -> Result<RunNetworkInstanceResponse, RpcError> {
-        self.ensure_safe_overwrite(&request)?;
-        self.inner.run_network_instance(controller, request).await
+        let (instance_id, config_json) = self.validate_one_shot_start(&request)?;
+        dispatch_host_command(HOST_COMMAND_START, instance_id, Some(config_json)).await?;
+        if !INSTANCE_MANAGER.instance_ids().contains(&instance_id) {
+            return Err(anyhow::anyhow!(
+                "HarmonyOS host reported success but the instance is not running"
+            )
+            .into());
+        }
+        Ok(RunNetworkInstanceResponse {
+            inst_id: Some(instance_id.into()),
+        })
     }
 
     async fn retain_network_instance(
@@ -413,9 +456,38 @@ impl WebClientService for NearbyWebClientService {
     async fn delete_network_instance(
         &self,
         _controller: BaseController,
-        _request: DeleteNetworkInstanceRequest,
+        request: DeleteNetworkInstanceRequest,
     ) -> Result<DeleteNetworkInstanceResponse, RpcError> {
-        Err(anyhow::anyhow!("nearby management cannot stop or delete a HarmonyOS instance").into())
+        if request.inst_ids.len() != 1 {
+            return Err(anyhow::anyhow!(
+                "HarmonyOS nearby control stops exactly one running instance"
+            )
+            .into());
+        }
+        let instance_id = Uuid::from(request.inst_ids[0].clone());
+        let running = INSTANCE_MANAGER.instance_ids();
+        if running.is_empty() {
+            return Ok(DeleteNetworkInstanceResponse {
+                remain_inst_ids: Vec::new(),
+            });
+        }
+        if running.len() != 1 || running[0] != instance_id {
+            return Err(anyhow::anyhow!(
+                "requested HarmonyOS instance is not the active controlled instance"
+            )
+            .into());
+        }
+        dispatch_host_command(HOST_COMMAND_STOP, instance_id, None).await?;
+        let remaining = INSTANCE_MANAGER.instance_ids();
+        if remaining.contains(&instance_id) {
+            return Err(anyhow::anyhow!(
+                "HarmonyOS host reported success but the instance is still running"
+            )
+            .into());
+        }
+        Ok(DeleteNetworkInstanceResponse {
+            remain_inst_ids: remaining.into_iter().map(Into::into).collect(),
+        })
     }
 
     async fn get_network_instance_config(
@@ -447,13 +519,8 @@ struct NearbyManagementHostServer {
 static NEARBY_HOST_SERVER: once_cell::sync::Lazy<Mutex<Option<NearbyManagementHostServer>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
 
-pub(crate) fn runtime_management_config_control(instance_id: Uuid) -> Option<ConfigFileControl> {
-    management_config_path(instance_id).map(|path| {
-        ConfigFileControl::new(
-            Some(path),
-            ConfigFilePermission::from(ConfigFilePermission::NO_DELETE),
-        )
-    })
+pub(crate) fn runtime_management_config_control(_instance_id: Uuid) -> ConfigFileControl {
+    ConfigFileControl::STATIC_CONFIG
 }
 
 pub(crate) fn ensure_runtime_management_server_started() -> bool {
@@ -494,10 +561,17 @@ pub(crate) fn ensure_runtime_management_server_started() -> bool {
 }
 
 pub(crate) fn stop_runtime_management_server() -> bool {
-    NEARBY_HOST_SERVER
+    let stopped = NEARBY_HOST_SERVER
         .lock()
         .map(|mut state| state.take().is_some())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if let Ok(mut commands) = NEARBY_HOST_COMMANDS.lock() {
+        commands.queued.clear();
+        for (_, sender) in commands.completions.drain() {
+            let _ = sender.send(Err("HarmonyOS nearby management host stopped".to_owned()));
+        }
+    }
+    stopped
 }
 
 struct NearbyManagementSession {
@@ -659,27 +733,6 @@ fn management_socket_url(path: &Path) -> Url {
         .expect("HarmonyOS sandbox path must form a Unix URL")
 }
 
-fn management_config_path(instance_id: Uuid) -> Option<PathBuf> {
-    config_root_dir().map(|root| {
-        root.join(MANAGEMENT_CONFIG_DIR_NAME)
-            .join(format!("{instance_id}.toml"))
-    })
-}
-
-fn config_id_from_management_path(path: &Path) -> anyhow::Result<Uuid> {
-    let file_stem = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| anyhow::anyhow!("nearby management config path is invalid"))?;
-    let instance_id = Uuid::parse_str(file_stem)?;
-    let expected = management_config_path(instance_id)
-        .ok_or_else(|| anyhow::anyhow!("HarmonyOS config store is not initialized"))?;
-    if expected != path {
-        anyhow::bail!("nearby management config path is outside the managed store");
-    }
-    Ok(instance_id)
-}
-
 fn valid_session_key(session_key: &str) -> bool {
     !session_key.is_empty()
         && session_key.len() <= MAX_SESSION_KEY_LENGTH
@@ -700,6 +753,90 @@ fn valid_rpc_packet_bytes(bytes: &[u8]) -> bool {
         header.packet_type,
         value if value == PacketType::RpcReq as u8 || value == PacketType::RpcResp as u8
     )
+}
+
+fn validate_ohos_envelope(envelope: &NearbyOhosEnvelope) -> anyhow::Result<()> {
+    if envelope.schema_version != OHOS_PRIVATE_SCHEMA_VERSION {
+        anyhow::bail!("unsupported HarmonyOS private packet schema");
+    }
+    Uuid::parse_str(&envelope.request_id)
+        .map_err(|_| anyhow::anyhow!("invalid HarmonyOS private request ID"))?;
+    if !matches!(
+        envelope.operation.as_str(),
+        OHOS_OPERATION_GET_SETTINGS | OHOS_OPERATION_UPDATE_SETTING
+    ) {
+        anyhow::bail!("unsupported HarmonyOS private operation");
+    }
+    if !matches!(envelope.kind.as_str(), "request" | "response") {
+        anyhow::bail!("invalid HarmonyOS private packet kind");
+    }
+    if envelope.kind == "request" && envelope.ok.is_some() {
+        anyhow::bail!("HarmonyOS private request cannot carry a result state");
+    }
+    if envelope.kind == "response" && envelope.ok.is_none() {
+        anyhow::bail!("HarmonyOS private response must carry a result state");
+    }
+    if envelope
+        .payload_json
+        .as_ref()
+        .is_some_and(|payload| payload.len() > MAX_OHOS_PRIVATE_PAYLOAD_BYTES)
+    {
+        anyhow::bail!("HarmonyOS private payload is too large");
+    }
+    if envelope
+        .error
+        .as_ref()
+        .is_some_and(|error| error.len() > MAX_OHOS_PRIVATE_ERROR_LENGTH)
+    {
+        anyhow::bail!("HarmonyOS private error is too large");
+    }
+    Ok(())
+}
+
+fn decode_ohos_envelope(bytes: &[u8]) -> anyhow::Result<NearbyOhosEnvelope> {
+    if bytes.is_empty() || bytes.len() > MAX_PACKET_BYTES {
+        anyhow::bail!("HarmonyOS private packet size is invalid");
+    }
+    let packet = ZCPacket::new_from_buf(BytesMut::from(bytes), ZCPacketType::NIC);
+    let header = packet
+        .peer_manager_header()
+        .ok_or_else(|| anyhow::anyhow!("HarmonyOS private packet header is missing"))?;
+    if header.packet_type != OHOS_PRIVATE_PACKET_TYPE {
+        anyhow::bail!("packet is not a HarmonyOS private packet");
+    }
+    let envelope = serde_json::from_slice::<NearbyOhosEnvelope>(packet.payload())?;
+    validate_ohos_envelope(&envelope)?;
+    Ok(envelope)
+}
+
+pub(crate) fn nearby_management_packet_kind(packet: Uint8Array) -> i32 {
+    let bytes = packet.to_vec();
+    if valid_rpc_packet_bytes(&bytes) {
+        return 1;
+    }
+    if decode_ohos_envelope(&bytes).is_ok() {
+        return 2;
+    }
+    0
+}
+
+pub(crate) fn encode_nearby_ohos_packet(envelope_json: String) -> Option<Uint8Array> {
+    let envelope = serde_json::from_str::<NearbyOhosEnvelope>(&envelope_json).ok()?;
+    validate_ohos_envelope(&envelope).ok()?;
+    let payload = serde_json::to_vec(&envelope).ok()?;
+    if payload.len() > MAX_OHOS_PRIVATE_PAYLOAD_BYTES {
+        return None;
+    }
+    let mut packet = ZCPacket::new_with_payload(&payload);
+    packet.fill_peer_manager_hdr(RPC_PEER_ID, RPC_PEER_ID, OHOS_PRIVATE_PACKET_TYPE);
+    Some(Uint8Array::from(
+        packet.convert_type(ZCPacketType::NIC).into_bytes().to_vec(),
+    ))
+}
+
+pub(crate) fn decode_nearby_ohos_packet(packet: Uint8Array) -> Option<String> {
+    let envelope = decode_ohos_envelope(&packet.to_vec()).ok()?;
+    serde_json::to_string(&envelope).ok()
 }
 
 fn session(session_key: &str) -> Option<Arc<NearbyManagementSession>> {
@@ -958,5 +1095,36 @@ mod tests {
         assert!(!valid_rpc_packet_bytes(&[1, 2, 3]));
         assert!(!valid_session_key("contains space"));
         assert!(valid_session_key("42:client"));
+    }
+
+    #[test]
+    fn ohos_private_settings_packet_round_trips_as_zcpacket() {
+        let request_id = Uuid::new_v4().to_string();
+        let raw = json!({
+            "schemaVersion": OHOS_PRIVATE_SCHEMA_VERSION,
+            "kind": "request",
+            "requestId": request_id,
+            "operation": OHOS_OPERATION_GET_SETTINGS,
+        })
+        .to_string();
+        let encoded = encode_nearby_ohos_packet(raw).expect("private packet must encode");
+        let bytes = encoded.to_vec();
+        assert_eq!(
+            nearby_management_packet_kind(Uint8Array::from(bytes.clone())),
+            2
+        );
+        let decoded =
+            decode_nearby_ohos_packet(Uint8Array::from(bytes)).expect("private packet must decode");
+        let envelope: NearbyOhosEnvelope = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(envelope.request_id, request_id);
+        assert_eq!(envelope.operation, OHOS_OPERATION_GET_SETTINGS);
+    }
+
+    #[test]
+    fn one_shot_runtime_has_no_persistent_config_path() {
+        let control = runtime_management_config_control(Uuid::new_v4());
+        assert!(control.path.is_none());
+        assert!(control.is_read_only());
+        assert!(control.is_no_delete());
     }
 }
