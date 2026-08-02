@@ -1288,10 +1288,15 @@ dependencies = [
 name = "easytier-ohrs"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "easytier",
+ "easytier-core",
+ "easytier-proto",
  "flate2",
+ "futures",
  "gethostname 1.1.0",
  "ipnet",
  "napi-build-ohos",

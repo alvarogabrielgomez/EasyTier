@@ -37,6 +37,7 @@ macro_rules! ohrs_log_debug {
 mod config;
 mod exports;
 mod kernel_bridge;
+mod nearby_management;
 mod platform;
 mod runtime;
 
@@ -57,7 +58,7 @@ use easytier::common::config::NetworkConfigExt;
 use easytier::common::constants::EASYTIER_VERSION;
 use easytier::common::{
     MachineIdOptions,
-    config::{ConfigFileControl, ConfigLoader, TomlConfigLoader},
+    config::{ConfigLoader, TomlConfigLoader},
 };
 use easytier::instance::factory::{NativeInstanceManager, native_instance_manager_with_runtime};
 use easytier::proto::api::manage::NetworkConfig;
@@ -68,6 +69,7 @@ use kernel_bridge::{
     stop_local_socket_server as stop_local_socket_server_inner,
 };
 use napi_derive_ohos::napi;
+use napi_ohos::bindgen_prelude::Uint8Array;
 use runtime::state::runtime_state::{RuntimeAggregateState, RuntimeInstanceState};
 use std::collections::{HashMap, HashSet};
 use std::format;
@@ -380,6 +382,7 @@ fn stop_runtime_inner() -> bool {
             && ok;
     }
     maybe_stop_local_socket_server();
+    let _ = nearby_management::stop_runtime_management_server();
     ok
 }
 
@@ -730,13 +733,24 @@ pub(crate) fn run_network_instance_from_json(cfg_json: &str) -> bool {
         return false;
     }
 
-    match INSTANCE_MANAGER.run_network_instance(cfg, ConfigFileControl::STATIC_CONFIG) {
+    let Some(config_control) = nearby_management::runtime_management_config_control(inst_id) else {
+        ohrs_log_error!("[Rust] nearby management config store is not initialized");
+        return false;
+    };
+    if !nearby_management::ensure_runtime_management_server_started() {
+        return false;
+    }
+
+    match INSTANCE_MANAGER.run_network_instance(cfg, config_control) {
         Ok(_) => {
             cache_runtime_config_snapshot(inst_id.to_string(), inst_id.to_string(), config);
             true
         }
         Err(err) => {
             ohrs_log_error!("[Rust] start_kernel failed for {}: {}", inst_id, err);
+            if INSTANCE_MANAGER.instance_ids().is_empty() {
+                let _ = nearby_management::stop_runtime_management_server();
+            }
             false
         }
     }
@@ -849,12 +863,16 @@ pub fn start_kernel(config_id: String) -> bool {
 
 #[napi]
 pub fn stop_kernel(config_id: String) -> bool {
-    exports::runtime_api::stop_kernel(
+    let stopped = exports::runtime_api::stop_kernel(
         config_id,
         stop_web_client,
         parse_instance_uuid,
         maybe_stop_local_socket_server,
-    )
+    );
+    if stopped && INSTANCE_MANAGER.instance_ids().is_empty() {
+        let _ = nearby_management::stop_runtime_management_server();
+    }
+    stopped
 }
 
 #[napi]
@@ -957,6 +975,48 @@ pub fn parse_network_config(cfg_json: String) -> bool {
 #[napi]
 pub fn run_network_instance(cfg_json: String) -> bool {
     run_network_instance_from_json(&cfg_json)
+}
+
+/// Opens one Core RPC endpoint for a HarmonyOS collaboration session.
+///
+/// The Harmony layer transports the returned native packets verbatim with
+/// `abilityConnectionManager.sendData`; all RPC framing stays inside Core.
+#[napi]
+pub fn open_nearby_management_session(session_key: String, host: bool) -> bool {
+    nearby_management::open_nearby_management_session(session_key, host)
+}
+
+#[napi]
+pub fn close_nearby_management_session(session_key: String) -> bool {
+    nearby_management::close_nearby_management_session(session_key)
+}
+
+#[napi]
+pub fn push_nearby_management_packet(session_key: String, packet: Uint8Array) -> bool {
+    nearby_management::push_nearby_management_packet(session_key, packet)
+}
+
+#[napi]
+pub fn drain_nearby_management_packets(session_key: String) -> Vec<Uint8Array> {
+    nearby_management::drain_nearby_management_packets(session_key)
+}
+
+#[napi]
+pub async fn call_nearby_management_json_rpc(
+    session_key: String,
+    service_name: String,
+    method_name: String,
+    domain_name: Option<String>,
+    payload_json: String,
+) -> String {
+    nearby_management::call_nearby_management_json_rpc(
+        session_key,
+        service_name,
+        method_name,
+        domain_name,
+        payload_json,
+    )
+    .await
 }
 
 #[napi]
