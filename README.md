@@ -1,3 +1,60 @@
+> [!NOTE]
+> ## This is a fork. You probably want [the original](https://github.com/EasyTier/EasyTier).
+>
+> This copy is maintained for **[Kanpachi](https://github.com/alvarogabrielgomez/kanpachi)**
+> and exists for exactly one reason. It is not a competing project, it tracks no
+> branch of its own, and it has no ambition to diverge.
+>
+> ### What is different
+>
+> Two calls removed from `easytier/src/instance/virtual_nic.rs`. Both wrote
+> permanent Windows Firewall ALLOW rules, by COM, from inside network startup:
+>
+> | Removed | What it wrote |
+> |---|---|
+> | `add_self_to_firewall_allowlist()` | inbound and outbound allow for the running executable, **any protocol, every interface on the machine** |
+> | `add_interface_to_firewall_allowlist()` | allow on the virtual interface for TCP, UDP, ICMP, and one rule for **any protocol**, with no port and no address restriction |
+>
+> Nothing else is touched, and that is meant to be checked rather than believed:
+>
+> ```
+> git diff v2.6.4 v2.6.4-kanpachi.1 -- '*.rs'
+> # one file changed, 8 insertions(+), 31 deletions(-)   ← the 8 are comments
+> ```
+>
+> Removing them is safe by upstream's own reckoning: both calls were already
+> wrapped in a `match` whose error arm logs a warning and continues, so their
+> absence is a state upstream already handles. The functions themselves are left
+> in place, unused and public.
+>
+> ### Why
+>
+> Kanpachi's promise is **[Kanpachi Protection](https://github.com/alvarogabrielgomez/kanpachi/blob/main/kanpachi-protection.md)**:
+> *everything the game did not ask for is closed on the virtual adapter.* It opens
+> only the ports the active game profile asks for, only toward the addresses of
+> the members present in the room. An unconditional allow-all on that same
+> adapter undoes it in the same layer used to grant access, and the rule covering
+> every interface reaches the user's home network, where Kanpachi's own packet
+> filter deliberately refuses to go.
+>
+> Those rules are correct for EasyTier's own subnet-proxy and KCP-proxy features.
+> Kanpachi runs with `proxy_cidrs` cleared and `enable_kcp_proxy` off, so it pays
+> their cost and uses neither. **This is a difference of product, not a defect
+> upstream.**
+>
+> ### Where things are
+>
+> - [`FORK.md`](FORK.md) — the changelog against upstream, one entry per tag
+> - [kanpachi-engine](https://github.com/alvarogabrielgomez/kanpachi-engine) — the
+>   binary that consumes this library. **No Kanpachi code lives here**, so that
+>   the diff above stays readable in one glance
+> - Everything below this box is upstream's README, unmodified
+>
+> Licence is unchanged: LGPL-3.0, and the full source of every published tag is
+> here.
+
+---
+
 # EasyTier
 
 [![Github release](https://img.shields.io/github/v/tag/EasyTier/EasyTier)](https://github.com/EasyTier/EasyTier/releases)

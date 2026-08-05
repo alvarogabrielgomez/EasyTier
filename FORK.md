@@ -16,8 +16,12 @@ no configuration turns it off. Everything else upstream does is kept.
 nothing else.** That claim is meant to be checked, not believed:
 
 ```
-git diff v2.6.4 v2.6.4-kanpachi.1
+git diff v2.6.4 v2.6.4-kanpachi.1 -- '*.rs'
+# one file changed, 8 insertions(+), 31 deletions(-)   ← the 8 are comments
 ```
+
+Outside the source there are two added documents, this one and a note at the top
+of `README.md` saying that this is a fork and pointing at the original.
 
 Nothing of Kanpachi's own lives here, and that is deliberate: the value of this
 repository is that its diff against upstream reads in one glance, and code of
