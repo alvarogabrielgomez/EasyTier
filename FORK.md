@@ -1,7 +1,16 @@
 # Kanpachi fork of EasyTier
 
+Part of **[Kanpachi Protection](https://github.com/alvarogabrielgomez/kanpachi/blob/main/kanpachi-protection.md)**:
+*everything the game did not ask for is closed on the virtual adapter.*
+
 This is a fork of [EasyTier/EasyTier](https://github.com/EasyTier/EasyTier),
-maintained for [Kanpachi](https://github.com/alvarogabrielgomez/kanpachi).
+maintained for [Kanpachi](https://github.com/alvarogabrielgomez/kanpachi) and
+consumed by its
+[engine](https://github.com/alvarogabrielgomez/kanpachi-engine).
+
+It exists for exactly one reason: upstream opens the virtual adapter in the
+Windows Firewall while creating it, which is the opposite of that promise, and
+no configuration turns it off. Everything else upstream does is kept.
 
 **Every tag published here is upstream plus the changes listed below, and
 nothing else.** That claim is meant to be checked, not believed:
@@ -9,6 +18,10 @@ nothing else.** That claim is meant to be checked, not believed:
 ```
 git diff v2.6.4 v2.6.4-kanpachi.1
 ```
+
+Nothing of Kanpachi's own lives here, and that is deliberate: the value of this
+repository is that its diff against upstream reads in one glance, and code of
+ours would bury it.
 
 ## Changelog against upstream
 
