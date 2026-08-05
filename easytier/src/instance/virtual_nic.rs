@@ -528,15 +528,10 @@ impl VirtualNic {
         {
             let dev_name = self.global_ctx.get_flags().dev_name;
 
-            match crate::arch::windows::add_self_to_firewall_allowlist() {
-                Ok(_) => tracing::info!("add_self_to_firewall_allowlist successful!"),
-                Err(error) => {
-                    log::warn!(%error, "Failed to add Easytier to firewall allowlist, Subnet proxy and KCP proxy may not work properly.");
-                    log::warn!(
-                        "You can add firewall rules manually, or use --use-smoltcp to run with user-space TCP/IP stack."
-                    );
-                }
-            }
+            // Kanpachi fork: the call to `add_self_to_firewall_allowlist()`
+            // was removed here. It granted this executable an inbound "allow
+            // any protocol" rule on EVERY interface of the machine, which the
+            // consuming product must decide for itself. See FORK.md.
 
             match RegistryManager::reg_delete_obsoleted_items(&dev_name) {
                 Ok(_) => tracing::trace!("delete successful!"),
@@ -692,28 +687,10 @@ impl VirtualNic {
 
         self.ifname = Some(ifname.to_owned());
 
-        #[cfg(target_os = "windows")]
-        {
-            // Add firewall rules for virtual NIC interface to allow all traffic
-            match crate::arch::windows::add_interface_to_firewall_allowlist(&ifname) {
-                Ok(_) => {
-                    tracing::info!(
-                        "Successfully configured Windows Firewall for interface: {}",
-                        ifname
-                    );
-                    tracing::info!(
-                        "All protocols (TCP/UDP/ICMP) are now allowed on interface: {}",
-                        ifname
-                    );
-                }
-                Err(error) => {
-                    log::warn!(%error, "Failed to configure Windows Firewall for interface {}\
-                    \n\tThis may cause connectivity issues with ping and other network functions.\
-                    \n\tPlease run as Administrator or manually configure Windows Firewall.\
-                    \n\tAlternatively, you can disable Windows Firewall for testing purposes.", ifname);
-                }
-            }
-        }
+        // Kanpachi fork: the call to `add_interface_to_firewall_allowlist()`
+        // was removed here. It opened the virtual interface to all traffic in
+        // the Windows Firewall, which is the opposite of what a product that
+        // decides per-game which ports to open needs. See FORK.md.
 
         Ok(Box::new(ft))
     }
