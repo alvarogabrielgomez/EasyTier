@@ -347,6 +347,17 @@ message GenerateCredentialResponse {
   string credential_secret = 2;   // private key base64
 }
 
+message RenewCredentialRequest {
+  string credential_id = 1;
+  int64 ttl_seconds = 2;             // must be > 0: new lifetime, counted from now
+  InstanceIdentifier instance = 3;   // target network instance
+}
+
+message RenewCredentialResponse {
+  bool success = 1;        // false: no credential has that id
+  int64 expiry_unix = 2;   // the new expiry, 0 when success is false
+}
+
 message RevokeCredentialRequest {
   string credential_id = 1;
   InstanceIdentifier instance = 2;   // target network instance
@@ -375,6 +386,7 @@ message ListCredentialsResponse {
 
 service CredentialManageRpc {
   rpc GenerateCredential(GenerateCredentialRequest) returns (GenerateCredentialResponse);
+  rpc RenewCredential(RenewCredentialRequest) returns (RenewCredentialResponse);
   rpc RevokeCredential(RevokeCredentialRequest) returns (RevokeCredentialResponse);
   rpc ListCredentials(ListCredentialsRequest) returns (ListCredentialsResponse);
 }

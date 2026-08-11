@@ -8,7 +8,7 @@ maintained for [Kanpachi](https://github.com/alvarogabrielgomez/kanpachi) and
 consumed by its
 [engine](https://github.com/alvarogabrielgomez/kanpachi-engine).
 
-It exists for exactly one reason: upstream opens the virtual adapter in the
+It started for exactly one reason: upstream opens the virtual adapter in the
 Windows Firewall while creating it, which is the opposite of that promise, and
 no configuration turns it off. Everything else upstream does is kept.
 
@@ -16,8 +16,8 @@ no configuration turns it off. Everything else upstream does is kept.
 nothing else.** That claim is meant to be checked, not believed:
 
 ```
-git diff v2.6.4 v2.6.4-kanpachi.1 -- '*.rs'
-# one file changed, 8 insertions(+), 31 deletions(-)   ← the 8 are comments
+git diff v2.6.4 v2.6.4-kanpachi.2 -- '*.rs' '*.proto'
+# five files changed, and every hunk is listed below
 ```
 
 Outside the source there are two added documents, this one and a note at the top
@@ -25,9 +25,41 @@ of `README.md` saying that this is a fork and pointing at the original.
 
 Nothing of Kanpachi's own lives here, and that is deliberate: the value of this
 repository is that its diff against upstream reads in one glance, and code of
-ours would bury it.
+ours would bury it. What is added is generic — a credential's expiry can be
+pushed forward — and carries no idea of rooms, invite codes or games.
 
 ## Changelog against upstream
+
+### `v2.6.4-kanpachi.2` — adds `renew_credential`
+
+One method added to the credential manager, and its RPC.
+
+| Added | Where | What it does |
+|---|---|---|
+| `CredentialManager::renew_credential(id, ttl)` | `easytier/src/peers/credential_manager.rs` | Moves an existing credential's `expiry_unix` to `now + ttl`, **keeping its keypair**, and returns the new expiry |
+| `rpc RenewCredential` | `easytier/src/proto/api_instance.proto` | Exposes it on `CredentialManageRpc`, implemented in both `peers/rpc_service.rs` and `rpc_service/credential_manage.rs` |
+
+#### Why it cannot be done with what upstream has
+
+`generate_credential` early-returns when the id already exists, so it cannot
+extend one. The alternative is revoke-and-reissue, and that changes the keypair:
+the credential secret **is** the holder's x25519 Noise static key, so a new one
+means the holder is a different peer, has to be re-trusted, and loses its
+session. For pushing an expiry forward that is the whole cost of the operation
+and none of the benefit.
+
+Expiry is enforced continuously and not only at handshake —
+`collect_trusted_credentials` drops expired entries and
+`disconnect_untrusted_peers` acts on that — so without this, every credential
+ends its holder's session at its TTL no matter how long the network has been up.
+
+#### What it deliberately does not do
+
+It emits no `CredentialChanged` event. Nothing about who is trusted changed, and
+`update_my_peer_info_routine` already republishes the trusted set every second,
+so the new expiry propagates within about a second on its own. Measured against
+a real binary: renewing a credential five seconds from death revived it, and the
+new expiry was counted from the moment of the call, not stacked on the old one.
 
 ### `v2.6.4-kanpachi.1` — from upstream `v2.6.4` (commit `8428a89`)
 

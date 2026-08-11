@@ -5,8 +5,8 @@ use crate::{
     proto::{
         api::instance::{
             CredentialManageRpc, GenerateCredentialRequest, GenerateCredentialResponse,
-            ListCredentialsRequest, ListCredentialsResponse, RevokeCredentialRequest,
-            RevokeCredentialResponse,
+            ListCredentialsRequest, ListCredentialsResponse, RenewCredentialRequest,
+            RenewCredentialResponse, RevokeCredentialRequest, RevokeCredentialResponse,
         },
         rpc_types::controller::BaseController,
     },
@@ -35,6 +35,17 @@ impl CredentialManageRpc for CredentialManageRpcService {
         super::get_instance_service(&self.instance_manager, &req.instance)?
             .get_credential_manage_service()
             .generate_credential(ctrl, req)
+            .await
+    }
+
+    async fn renew_credential(
+        &self,
+        ctrl: Self::Controller,
+        req: RenewCredentialRequest,
+    ) -> crate::proto::rpc_types::error::Result<RenewCredentialResponse> {
+        super::get_instance_service(&self.instance_manager, &req.instance)?
+            .get_credential_manage_service()
+            .renew_credential(ctrl, req)
             .await
     }
 

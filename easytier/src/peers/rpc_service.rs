@@ -14,8 +14,9 @@ use crate::{
             ListCredentialsResponse, ListForeignNetworkRequest, ListForeignNetworkResponse,
             ListGlobalForeignNetworkRequest, ListGlobalForeignNetworkResponse, ListPeerRequest,
             ListPeerResponse, ListPublicIpv6InfoRequest, ListPublicIpv6InfoResponse,
-            ListRouteRequest, ListRouteResponse, PeerInfo, PeerManageRpc, RevokeCredentialRequest,
-            RevokeCredentialResponse, ShowNodeInfoRequest, ShowNodeInfoResponse,
+            ListRouteRequest, ListRouteResponse, PeerInfo, PeerManageRpc, RenewCredentialRequest,
+            RenewCredentialResponse, RevokeCredentialRequest, RevokeCredentialResponse,
+            ShowNodeInfoRequest, ShowNodeInfoResponse,
         },
         rpc_types::{self, controller::BaseController},
     },
@@ -258,6 +259,46 @@ impl CredentialManageRpc for PeerManagerRpcService {
         Ok(GenerateCredentialResponse {
             credential_id: id,
             credential_secret: secret,
+        })
+    }
+
+    /// Extends a credential's life without changing its keypair.
+    ///
+    /// Same admin check as generating and revoking: only a node holding the
+    /// network secret publishes trusted credentials, so only it can say one is
+    /// still good.
+    ///
+    /// An unknown id comes back as `success: false` rather than an error. It is
+    /// the ordinary outcome of a caller renewing on a timer while the holder
+    /// was revoked or expired in between, and an error there would be
+    /// indistinguishable from the engine being unreachable.
+    async fn renew_credential(
+        &self,
+        _: BaseController,
+        request: RenewCredentialRequest,
+    ) -> Result<RenewCredentialResponse, rpc_types::error::Error> {
+        let pm = weak_upgrade(&self.peer_manager)?;
+        let global_ctx = pm.get_global_ctx();
+        if global_ctx.get_network_identity().network_secret.is_none() {
+            return Err(rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                "only admin nodes (with network_secret) can renew credentials"
+            )));
+        }
+
+        if request.ttl_seconds <= 0 {
+            return Err(rpc_types::error::Error::ExecutionError(anyhow::anyhow!(
+                "ttl_seconds must be positive"
+            )));
+        }
+        let ttl = Duration::from_secs(request.ttl_seconds as u64);
+
+        let expiry_unix = global_ctx
+            .get_credential_manager()
+            .renew_credential(&request.credential_id, ttl);
+
+        Ok(RenewCredentialResponse {
+            success: expiry_unix.is_some(),
+            expiry_unix: expiry_unix.unwrap_or(0),
         })
     }
 

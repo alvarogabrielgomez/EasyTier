@@ -181,6 +181,43 @@ impl CredentialManager {
         (entry, secret)
     }
 
+    /// Pushes an existing credential's expiry out, keeping its keypair.
+    ///
+    /// Returns the new `expiry_unix`, or `None` when no credential has that id.
+    ///
+    /// # Why this is a separate function and not a fix to `generate_*`
+    ///
+    /// `generate_credential_with_options` given an id that already exists
+    /// returns the stored secret and leaves `expiry_unix` untouched. Changing
+    /// that would alter what upstream callers get from a call they already
+    /// make, so this is additive instead: renewing is a different intent from
+    /// generating and now says so.
+    ///
+    /// # Why renewing has to keep the keypair
+    ///
+    /// Because the credential's secret IS the holder's Noise static key, and
+    /// the connection it has open was established with it. Handing out a fresh
+    /// keypair is not a renewal, it is a new credential the holder can only
+    /// adopt by tearing its instance down and reconnecting. Extending the date
+    /// in place is what lets a room outlive one credential lifetime without
+    /// every member reconnecting on a timer.
+    ///
+    /// No `CredentialChanged` event is issued for this, unlike revoking, and
+    /// that is deliberate: revoking changes who is in the network, renewing
+    /// changes nobody. The new expiry reaches the other peers anyway, because
+    /// `update_my_peer_info` re-reads the trusted pubkeys and compares, and its
+    /// routine already runs once a second.
+    pub fn renew_credential(&self, credential_id: &str, ttl: Duration) -> Option<i64> {
+        let expiry_unix = {
+            let mut credentials = self.credentials.lock().unwrap();
+            let entry = credentials.get_mut(credential_id)?;
+            entry.expiry_unix = current_unix_timestamp() + ttl.as_secs() as i64;
+            entry.expiry_unix
+        };
+        self.save_to_disk();
+        Some(expiry_unix)
+    }
+
     pub fn revoke_credential(&self, credential_id: &str) -> bool {
         let removed = self
             .credentials
