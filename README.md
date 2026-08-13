@@ -18,8 +18,8 @@
 > Nothing else is touched, and that is meant to be checked rather than believed:
 >
 > ```
-> git diff v2.6.4 v2.6.4-kanpachi.1 -- '*.rs'
-> # one file changed, 8 insertions(+), 31 deletions(-)   ← the 8 are comments
+> git diff v2.6.4 kanpachi -- '*.rs' '*.proto'
+> # every hunk is listed in FORK.md
 > ```
 >
 > Removing them is safe by upstream's own reckoning: both calls were already

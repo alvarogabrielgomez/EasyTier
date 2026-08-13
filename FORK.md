@@ -12,13 +12,27 @@ It started for exactly one reason: upstream opens the virtual adapter in the
 Windows Firewall while creating it, which is the opposite of that promise, and
 no configuration turns it off. Everything else upstream does is kept.
 
-**Every tag published here is upstream plus the changes listed below, and
-nothing else.** That claim is meant to be checked, not believed:
+**The `kanpachi` branch is upstream plus the changes listed below, and nothing
+else.** That claim is meant to be checked, not believed:
 
 ```
-git diff v2.6.4 v2.6.4-kanpachi.2 -- '*.rs' '*.proto'
+git diff v2.6.4 kanpachi -- '*.rs' '*.proto'
 # five files changed, and every hunk is listed below
 ```
+
+## Branch or tag, and which one to use
+
+**Kanpachi follows the `kanpachi` branch, which moves.** This fork is not
+versioned and the product that consumes it is at v0, so a tag per patch set
+bought a number nobody read at the price of force-pushing it every time the
+fork changed. Following a moving branch costs nothing there, because
+`Cargo.lock` pins the commit and a build never consults the branch: what
+consults it is `cargo update`, which is somebody's deliberate act.
+
+**To pin instead of follow, use the `v2.6.4-kanpachi` tag**, a snapshot of this
+branch that never moves. When the branch moves on and somebody needs a pin at
+the new point, that is the moment to cut a tag for it and to decide how the
+series is named. Deciding it now costs a naming scheme and buys nothing.
 
 Outside the source there are two added documents, this one and a note at the top
 of `README.md` saying that this is a fork and pointing at the original.
@@ -30,7 +44,10 @@ pushed forward — and carries no idea of rooms, invite codes or games.
 
 ## Changelog against upstream
 
-### `v2.6.4-kanpachi.2` — adds `renew_credential`
+Newest first, and named by commit. These entries used to be titled by tag, and
+the tags are gone for the reason above.
+
+### Adds `renew_credential` (commit `c98aa15`)
 
 One method added to the credential manager, and its RPC.
 
@@ -61,7 +78,7 @@ so the new expiry propagates within about a second on its own. Measured against
 a real binary: renewing a credential five seconds from death revived it, and the
 new expiry was counted from the moment of the call, not stacked on the old one.
 
-### `v2.6.4-kanpachi.1` — from upstream `v2.6.4` (commit `8428a89`)
+### Removes the firewall calls, which is why this fork exists (commit `42894f5`, from upstream `v2.6.4` at `8428a89`)
 
 Two calls removed from `easytier/src/instance/virtual_nic.rs`. Both wrote
 Windows Firewall ALLOW rules, by COM, from inside network startup.
