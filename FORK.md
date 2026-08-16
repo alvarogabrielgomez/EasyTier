@@ -12,13 +12,21 @@ It started for exactly one reason: upstream opens the virtual adapter in the
 Windows Firewall while creating it, which is the opposite of that promise, and
 no configuration turns it off. Everything else upstream does is kept.
 
-**The `kanpachi` branch is upstream plus the changes listed below, and nothing
-else.** That claim is meant to be checked, not believed:
+**The `kanpachi` branch is upstream `v2.6.4` plus the changes listed below, and
+nothing else.** That claim is meant to be checked, not believed:
 
 ```
 git diff v2.6.4 kanpachi -- '*.rs' '*.proto'
-# five files changed, and every hunk is listed below
+# every hunk belongs to an entry below
 ```
+
+The changes come in two kinds, and the changelog names which is which:
+
+- **Backports**: upstream fixes that exist on upstream `main` and in no
+  release (`v2.6.4` is the newest release upstream has ever cut). They keep
+  their upstream authorship, and each entry says what was adapted.
+- **Own changes**: what this fork adds or removes on its own. Still generic —
+  no rooms, no invite codes, no games.
 
 ## Branch or tag, and which one to use
 
@@ -46,6 +54,74 @@ pushed forward — and carries no idea of rooms, invite codes or games.
 
 Newest first, and named by commit. These entries used to be titled by tag, and
 the tags are gone for the reason above.
+
+### Own: the freshest incarnation wins the credential owner election (commit `9c383f4`)
+
+One decision changed in `easytier/src/peers/peer_ospf_route.rs`, in
+`collect_non_reusable_credential_owners`: among active peers holding the same
+non-reusable credential pubkey, the owner used to be the **numerically lowest
+peer id**, and is now the one with the **freshest `RoutePeerInfo.last_update`**,
+ties falling back to the lowest id.
+
+Peer ids are random per instance start. A peer that reconnects keeps its
+credential pubkey and draws a new random id, and while its previous incarnation
+lingered in the route table — up to `REMOVE_UNREACHABLE_PEER_INFO_AFTER`, 90
+seconds — the returning peer could **lose the election to its own ghost**:
+hard-closed every route refresh before #2315, silently route-suppressed after
+it. `last_update` is restamped with the local clock on every accepted update,
+so the ghost's timestamp freezes while the live incarnation keeps advancing.
+
+Measured before the fix, from the product on top: a guest whose data path died
+re-enrolled with a fresh credential once per minute — the fresh pubkey was the
+only way to dodge the ghost — burning a virtual IP per lap.
+
+**The `reusable` flag stays `false` on purpose.** The credential secret IS the
+holder's Noise static key, so `reusable=true` would legalize cloning it. The
+fix is the election, never disabling it. The test suite gains the mirror case
+the old test could not catch: the ghost holding the LOWER id.
+
+### Backport: recover from asymmetric direct connections (upstream #2476, commit `5ac9a39`)
+
+Ported backwards from upstream `main`, which restructured the crate into
+`easytier-core` after `v2.6.4`. Three of its four changes land here:
+
+| Change | Where |
+|---|---|
+| A pong must MATCH the outstanding ping to reset the consecutive-loss counter, so a half-open direct connection leaves the peer map instead of looking healthy on unrelated ingress | `easytier/src/peers/peer_conn_ping.rs` |
+| Peer-center reports become atomic per-peer snapshots, with topology costs in the digest, so removals and latency updates propagate | `easytier/src/peer_center/server.rs` |
+| Relay handshakes and their acks honor latency-first policy and route around stale direct adjacencies | `easytier/src/peers/relay_peer_map.rs` |
+
+**Not ported**: the saturated-NIC egress change, written against the
+portable-core packet pipeline this tree does not have. **Adapted**: its test
+arrives rewritten against this tree's `PeerConnPinger`, and
+`peer_conn_pingpong_oneside_timeout` now expects the close, because its old
+expectation was the exact bug this fixes. **Deliberately not backported yet**:
+upstream #2497 (echo liveness probes on data traffic), a hardening of this fix
+built on the post-split layout; it becomes worth porting only if measurement
+shows half-open detection still lagging.
+
+### Backport: preserve secure relay sessions during cleanup (upstream #2393, commit `24be0f0`)
+
+In `v2.6.4` the secure-mode session GC judged liveness by `Arc::strong_count`
+alone, so a still-active E2EE relay session could be collected mid-use — a
+guest reaching the host through a relay lost its encrypted session for no
+reason. Adapted: the commit's parent tree used the `hotpath` profiling crate
+(added upstream in #2380, removed in #2394, never in `v2.6.4`); its `Instant`
+import becomes `std::time::Instant`, which is where upstream `main` also ended.
+
+### Backport: fix credential OSPF logic (upstream #2315, commit `f279a62`)
+
+The upstream squash, restricted to the `easytier/` crate (it also carried
+`easytier-web`, `easytier-gui` and `easytier-contrib` changes this fork does
+not ship). What it fixes here: duplicate holders of a non-reusable credential
+are **route-suppressed instead of hard-closed every refresh**, expired
+credentials disconnect their stale peers cleanly, and the UDP subnet proxy
+gains loop protection.
+
+### Backport: detect credential mode in TOML config loader (upstream #2301, commit `0a9f26d`)
+
+Credential nodes loaded from a TOML file were misidentified as regular nodes.
+Clean pick, no adaptation.
 
 ### Adds `renew_credential` (commit `c98aa15`)
 
