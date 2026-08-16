@@ -2307,9 +2307,14 @@ pub mod tests {
         peer_conn_pingpong_test_common(3, 5, false, false).await;
     }
 
+    // Before #2476 this expected the connection to SURVIVE: the mocked rx
+    // traffic counted as proof of a healthy round trip, which is exactly the
+    // half-open-tunnel bug that fix removes. Nine consecutive unanswered
+    // pings with only unrelated ingress now close the connection, so the
+    // stale path leaves the peer map and a relay can take over.
     #[tokio::test]
     async fn peer_conn_pingpong_oneside_timeout() {
-        peer_conn_pingpong_test_common(4, 12, false, false).await;
+        peer_conn_pingpong_test_common(4, 12, true, false).await;
     }
 
     #[tokio::test]

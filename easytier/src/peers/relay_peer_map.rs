@@ -137,6 +137,9 @@ impl RelayPeerMap {
     ) -> Result<(), Error> {
         let mut pkt = ZCPacket::new_with_payload(&payload);
         pkt.fill_peer_manager_hdr(self.my_peer_id, dst_peer_id, packet_type as u8);
+        pkt.mut_peer_manager_header()
+            .unwrap()
+            .set_latency_first(matches!(&policy, NextHopPolicy::LeastCost));
         let pkt_len = pkt.buf_len() as u64;
         self.send_via_next_hop(pkt, dst_peer_id, policy).await?;
         self.control_metrics.record_tx(pkt_len);
@@ -493,6 +496,17 @@ impl RelayPeerMap {
     }
 
     async fn handle_relay_msg1(&self, msg1: ZCPacket, remote_peer_id: PeerId) -> Result<(), Error> {
+        let header = msg1
+            .peer_manager_header()
+            .ok_or_else(|| Error::RouteError(Some("packet without header".to_string())))?;
+        let ack_policy = if header.is_latency_first() || header.forward_counter > 0 {
+            // Older peers do not mark latency-first handshakes. A forwarded
+            // request must still avoid the stale direct-peer shortcut.
+            NextHopPolicy::LeastCost
+        } else {
+            NextHopPolicy::LeastHop
+        };
+
         // Check for bidirectional handshake race condition.
         // If we are also waiting for a RelayHandshakeAck from this peer,
         // use deterministic rule: the peer with smaller peer_id becomes initiator.
@@ -601,7 +615,7 @@ impl RelayPeerMap {
             out[..out_len].to_vec(),
             PacketType::RelayHandshakeAck,
             remote_peer_id,
-            NextHopPolicy::LeastHop,
+            ack_policy,
         )
         .await?;
 
@@ -620,6 +634,11 @@ impl RelayPeerMap {
             .peer_manager_header()
             .ok_or_else(|| Error::RouteError(Some("packet without header".to_string())))?;
         let from_peer_id = hdr.from_peer_id.get();
+        let handshake_policy = if hdr.is_latency_first() || hdr.forward_counter > 0 {
+            NextHopPolicy::LeastCost
+        } else {
+            NextHopPolicy::LeastHop
+        };
         let network = self.global_ctx.get_network_identity();
         let key = SessionKey::new(network.network_name.clone(), from_peer_id);
         let Some(session) = self.peer_session_store.get(&key) else {
@@ -627,8 +646,7 @@ impl RelayPeerMap {
                 "relay session not found for peer {}, try handshake",
                 from_peer_id
             );
-            self.ensure_session(from_peer_id, NextHopPolicy::LeastHop)
-                .await?;
+            self.ensure_session(from_peer_id, handshake_policy).await?;
             return Ok(false);
         };
         let now = Instant::now();
