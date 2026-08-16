@@ -636,8 +636,27 @@ impl SyncedRouteInfo {
         let mut active_owners = HashMap::new();
         let mut duplicate_untrusted_peers = BTreeSet::new();
 
+        // The owner is the FRESHEST candidate, not the numerically lowest.
+        //
+        // Peer ids are random per instance start, so picking the lowest id made
+        // the election blind to which incarnation is alive: a peer that
+        // reconnects keeps its credential pubkey but draws a new random id, and
+        // while its previous incarnation lingered in `peer_infos` (up to
+        // REMOVE_UNREACHABLE_PEER_INFO_AFTER), the returning peer could lose
+        // the election to its own ghost and stay suppressed until the ghost
+        // aged out. `last_update` is restamped with the LOCAL clock on every
+        // accepted update, so it is comparable across peers: the ghost's
+        // timestamp freezes while the live incarnation keeps advancing. Ties
+        // fall back to the lowest id, which is the old behavior.
         for (pubkey, candidate_peer_ids) in candidates {
-            let Some(owner_peer_id) = candidate_peer_ids.iter().next().copied() else {
+            let freshness = |peer_id: &PeerId| -> Option<SystemTime> {
+                SystemTime::try_from(peer_infos.get(peer_id)?.last_update?).ok()
+            };
+            let Some(owner_peer_id) = candidate_peer_ids
+                .iter()
+                .max_by_key(|peer_id| (freshness(peer_id), std::cmp::Reverse(**peer_id)))
+                .copied()
+            else {
                 continue;
             };
             active_owners.insert(pubkey, owner_peer_id);
@@ -4249,7 +4268,7 @@ mod tests {
     use super::{
         NextHopInfo, PeerRoute, REMOVE_DEAD_PEER_INFO_AFTER, RouteConnInfo, SyncRouteSession,
     };
-    use crate::proto::common::TimestampExt;
+    use prost::Message;
     use crate::{
         common::{
             PeerId,
@@ -5575,6 +5594,101 @@ mod tests {
                 .get(&credential_key)
                 .map(|entry| *entry.value()),
             Some(replacement_peer_id)
+        );
+    }
+
+    /// The mirror of the test above, and the case the old election lost.
+    ///
+    /// The test above has the replacement at the LOWER id (39 vs 41), so it
+    /// passed under lowest-id-wins for the wrong reason. Here the ghost — the
+    /// previous incarnation of the SAME machine, same credential pubkey,
+    /// frozen `last_update`, still inside its reachability window — holds the
+    /// lower id, and the returning incarnation draws a higher one. Freshness
+    /// must decide, not the id.
+    #[tokio::test]
+    async fn newest_incarnation_wins_owner_election_against_lower_id_ghost() {
+        const NETWORK_SECRET: &str = "sec1";
+        const SELF_PEER_ID: PeerId = 1;
+
+        let service_impl = PeerRouteServiceImpl::new(
+            SELF_PEER_ID,
+            get_mock_global_ctx_with_network(Some(NetworkIdentity::new(
+                "test-net".to_string(),
+                NETWORK_SECRET.to_string(),
+            ))),
+        );
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let credential_key = vec![9; 32];
+        let admin_peer_id = 30;
+        let ghost_peer_id = 39;
+        let returning_peer_id = 41;
+
+        let mut self_info = RoutePeerInfo::new();
+        self_info.peer_id = SELF_PEER_ID;
+        self_info.version = 1;
+
+        let admin_info =
+            make_admin_route_peer_info(admin_peer_id, &credential_key, NETWORK_SECRET, now_unix);
+
+        let now = std::time::SystemTime::now();
+        let mut ghost_peer = make_credential_route_peer_info(ghost_peer_id, &credential_key);
+        ghost_peer.last_update = Some((now - Duration::from_secs(60)).into());
+        let mut returning_peer =
+            make_credential_route_peer_info(returning_peer_id, &credential_key);
+        returning_peer.last_update = Some(now.into());
+
+        {
+            let mut guard = service_impl.synced_route_info.peer_infos.write();
+            guard.insert(self_info.peer_id, self_info);
+            guard.insert(admin_info.peer_id, admin_info);
+            guard.insert(ghost_peer.peer_id, ghost_peer);
+            guard.insert(returning_peer.peer_id, returning_peer);
+        }
+
+        // BOTH incarnations hang off the admin, so both count as active: the
+        // ghost window is precisely "still reachable, no longer alive".
+        {
+            let mut guard = service_impl.synced_route_info.conn_map.write();
+            guard.insert(SELF_PEER_ID, make_route_conn_info([admin_peer_id], now));
+            guard.insert(
+                admin_peer_id,
+                make_route_conn_info(
+                    [SELF_PEER_ID, ghost_peer_id, returning_peer_id],
+                    now,
+                ),
+            );
+            guard.insert(ghost_peer_id, make_route_conn_info([admin_peer_id], now));
+            guard.insert(
+                returning_peer_id,
+                make_route_conn_info([admin_peer_id], now),
+            );
+        }
+        service_impl.synced_route_info.version.set(2);
+
+        service_impl.update_route_table_and_cached_local_conn_bitmap();
+        assert!(service_impl.is_active_non_reusable_credential_peer(ghost_peer_id));
+        assert!(service_impl.is_active_non_reusable_credential_peer(returning_peer_id));
+
+        let untrusted = service_impl.refresh_credential_trusts_with_current_topology();
+        // Since #2315 a duplicate is suppressed, never disconnected.
+        assert!(untrusted.is_empty());
+        assert_eq!(
+            service_impl
+                .synced_route_info
+                .non_reusable_credential_owners
+                .get(&credential_key)
+                .map(|entry| *entry.value()),
+            Some(returning_peer_id)
+        );
+        assert!(
+            service_impl
+                .synced_route_info
+                .suppressed_non_reusable_credential_peers
+                .contains_key(&ghost_peer_id)
         );
     }
 
